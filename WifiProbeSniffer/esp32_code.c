@@ -1,86 +1,86 @@
 /*
-  ESP32 Probe-Request Sniffer (use arduinoIDE)
-  - Tracks up to 5 devices
+  ESP32 Probe-Request Sniffer (use Arduino IDE)
+  - Averages signal strength for up to MAX_DEVICES devices
   - Buffers CSV lines in RAM and flushes them to SPIFFS from loop()
-  - Blinks blue LED when a probe request is successfully parsed
+  - Blinks blue LED each time a probe request is logged
   - Send "GET_CSV\n" over USB Serial to retrieve /probes.csv
 */
 
 #include <WiFi.h>
-#include "esp_wifi.h"
+#include <esp_wifi.h>
 #include <SPIFFS.h>
 
 #define LED_PIN 2
 
-// Tracking limits
 #define MAX_DEVICES 5
 #define CHANNEL_MIN 1
 #define CHANNEL_MAX 13
 #define CHANNEL_HOP_MS 200
 
-// Pending CSV buffer 
-#define PENDING_CAP 64        // max pending lines in RAM
-#define PENDING_LINE_MAX 128  // max bytes per CSV line
+#define PENDING_CAP 64
+#define PENDING_LINE_MAX 128
+#define SSID_MAX_LEN 32
+
+#define CSV_PATH "/probes.csv"
+#define FLUSH_INTERVAL_MS 2000
+#define LED_BLINK_MS 50
+
+#define RSSI_AT_1M (-30)   // expected RSSI 1 m from a phone
+#define PATH_LOSS_N 3.0f   // avg for inside
 
 struct Device {
   uint8_t mac[6];
   int avgRSSI;
-  char ssid[33];
   bool used;
 };
 
 Device devices[MAX_DEVICES];
-int deviceCount = 0;
 
 int currentChannel = CHANNEL_MIN;
 unsigned long lastHop = 0;
+unsigned long lastFlush = 0;
+bool fsReady = false;
 
-// pending circular buffer
+// buffer shared between the wifi callback and loop()
 char pending[PENDING_CAP][PENDING_LINE_MAX];
-volatile int pending_head = 0; // next to read 
-volatile int pending_tail = 0; // next to write
-volatile int pending_count = 0;
+int pendingHead = 0;
+int pendingCount = 0;
+portMUX_TYPE pendingMux = portMUX_INITIALIZER_UNLOCKED;
 
-// LED blink state
 volatile bool packetDetected = false;
-unsigned long ledEndTime = 0;
-const unsigned long LED_BLINK_MS = 50;
+bool ledOn = false;
+unsigned long ledOnSince = 0;
 
-//convert MAC bytes to upper-case hex 
-void macToHexStr(const uint8_t *mac, char *out, size_t outLen) {
- 
-  const char hex[] = "0123456789ABCDEF";
-  int pos = 0;
-  for (int i = 0; i < 6 && pos + 3 < (int)outLen; ++i) {
-    uint8_t b = mac[i];
-    out[pos++] = hex[(b >> 4) & 0xF];
-    out[pos++] = hex[b & 0xF];
-    if (i < 5) out[pos++] = ':';
-  }
-  out[pos] = '\0';
+void macToHexStr(const uint8_t *mac, char *out, int outLen) {
+  snprintf(out, outLen, "%02X:%02X:%02X:%02X:%02X:%02X",
+           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 }
 
-// Estimate distance in cm using log-distance path loss.
-int estimateDistanceCM(int rssi, int txPower = -30, float n = 3.0f) {
-  float exp = ((float)(txPower - rssi)) / (10.0f * n);
-  float meters = powf(10.0f, exp);
-  int cm = (int)(meters * 100.0f + 0.5f);
-  if (cm < 0) cm = 0;
-  return cm;
+// Log-distance path loss model - spend some time calibrating this if it's important to you
+int estimateDistanceCM(int rssi) {
+  float exponent = (float)(RSSI_AT_1M - rssi) / (10.0f * PATH_LOSS_N);
+  float meters = powf(10.0f, exponent);
+  return (int)(meters * 100.0f + 0.5f);
 }
 
-// Extract SSID
-bool extractSSID(const uint8_t *buf, int len, char *ssidOut, int ssidOutLen) {
-  int i = 0;
+// Finds the next SSID tag at or after *pos, replacing characters that would break the CSV.
+// On success, *pos is moved past that tag so the next call finds the following SSID.
+bool extractSSID(const uint8_t *buf, int len, int *pos, char *ssidOut, int ssidOutLen) {
+  int i = *pos;
   while (i + 2 <= len) {
     uint8_t tag = buf[i];
     uint8_t slen = buf[i + 1];
-    if (i + 2 + slen > len) break;
+    if (i + 2 + slen > len) return false;
     if (tag == 0x00) {
       int copyLen = slen;
       if (copyLen > ssidOutLen - 1) copyLen = ssidOutLen - 1;
-      if (copyLen > 0) memcpy(ssidOut, buf + i + 2, copyLen);
+      for (int k = 0; k < copyLen; ++k) {
+        uint8_t c = buf[i + 2 + k];
+        if (c < ' ' || c > '~' || c == ',' || c == '"') c = '_';
+        ssidOut[k] = c;
+      }
       ssidOut[copyLen] = '\0';
+      *pos = i + 2 + slen;
       return true;
     }
     i += 2 + slen;
@@ -88,103 +88,124 @@ bool extractSSID(const uint8_t *buf, int len, char *ssidOut, int ssidOutLen) {
   return false;
 }
 
-// Find device by MAC or add a new one 
-Device* getDeviceOrAdd(const uint8_t *mac, const char *ssid, int rssi) {
+// Checks if a MAC is being tracks and updates its avg RSSI, adds new MACs or returns NULL if array is full
+Device* getDeviceOrAdd(const uint8_t *mac, int rssi) {
   for (int i = 0; i < MAX_DEVICES; ++i) {
-    if (devices[i].used) {
-      bool match = true;
-      for (int j = 0; j < 6; ++j) {
-        if (devices[i].mac[j] != mac[j]) { match = false; break; }
-      }
-      if (match) {
-        devices[i].avgRSSI = (devices[i].avgRSSI + rssi) / 2;
-        return &devices[i];
-      }
+    if (devices[i].used && memcmp(devices[i].mac, mac, 6) == 0) {
+      devices[i].avgRSSI = (devices[i].avgRSSI + rssi) / 2;
+      return &devices[i];
     }
   }
-  // add new device if we have space
   for (int i = 0; i < MAX_DEVICES; ++i) {
     if (!devices[i].used) {
       devices[i].used = true;
       memcpy(devices[i].mac, mac, 6);
       devices[i].avgRSSI = rssi;
-      strncpy(devices[i].ssid, ssid ? ssid : "", 32);
-      devices[i].ssid[32] = '\0';
-      ++deviceCount;
       return &devices[i];
     }
   }
   return NULL;
 }
 
-// queue CSV line into buffer
-void enqueueLineFromCallback(const char *line) {
-  int nextTail = (pending_tail + 1) % PENDING_CAP;
-  if (nextTail == pending_head) {
-    pending_head = (pending_head + 1) % PENDING_CAP;
-    pending_count = max(0, pending_count - 1);
+// Adds a CSV line to the end of the buffer
+void enqueueLine(const char *line) {
+  portENTER_CRITICAL(&pendingMux);
+  if (pendingCount == PENDING_CAP) {
+    pendingHead = (pendingHead + 1) % PENDING_CAP;
+    pendingCount--;
   }
-  strncpy(pending[pending_tail], line, PENDING_LINE_MAX - 1);
-  pending[pending_tail][PENDING_LINE_MAX - 1] = '\0';
-  pending_tail = nextTail;
-  if (pending_count < PENDING_CAP) ++pending_count;
+  int tail = (pendingHead + pendingCount) % PENDING_CAP;
+  strlcpy(pending[tail], line, PENDING_LINE_MAX);
+  pendingCount++;
+  portEXIT_CRITICAL(&pendingMux);
 }
 
-// parse probe request, prepare CSV line, and queue
-void snifferCallback(void* buf, wifi_promiscuous_pkt_type_t type) {
-  if (type != WIFI_PKT_MGMT) return; // if not the right type of packet return
-  const wifi_promiscuous_pkt_t *ppkt = (wifi_promiscuous_pkt_t*) buf;
-  const uint8_t *payload = ppkt->payload;
-  int len = ppkt->rx_ctrl.sig_len;
-  int8_t rssi = ppkt->rx_ctrl.rssi;
-  uint8_t ch = ppkt->rx_ctrl.channel;
+// Copies the oldest CSV line from buffer into input var
+bool dequeueLine(char *out) {
+  portENTER_CRITICAL(&pendingMux);
+  if (pendingCount == 0) {
+    portEXIT_CRITICAL(&pendingMux);
+    return false;
+  }
+  strlcpy(out, pending[pendingHead], PENDING_LINE_MAX);
+  pendingHead = (pendingHead + 1) % PENDING_CAP;
+  pendingCount--;
+  portEXIT_CRITICAL(&pendingMux);
+  return true;
+}
 
+// For each captured packet it logs one CSV line per SSID in every probe request
+void snifferCallback(void *buf, wifi_promiscuous_pkt_type_t type) {
+  if (type != WIFI_PKT_MGMT) return;
+  wifi_promiscuous_pkt_t *ppkt = (wifi_promiscuous_pkt_t *)buf;
+  const uint8_t *payload = ppkt->payload;
+  int len = (int)ppkt->rx_ctrl.sig_len - 4;  // Verifies length of packet
   if (len <= 24) return;
 
   uint8_t fc0 = payload[0];
+  uint8_t frameType = (fc0 >> 2) & 0x03;
   uint8_t subtype = (fc0 >> 4) & 0x0F;
-  uint8_t typefield = (payload[0] >> 2) & 0x03;
-  if (typefield != 0 || subtype != 4) return; 
+  if (frameType != 0 || subtype != 4) return;  // probe requests only
 
-  const uint8_t *srcMac = payload + 10;
-  const uint8_t *tagged = payload + 24;
-  int tagged_len = len - 24;
-  if (tagged_len <= 0) return;
+  const uint8_t *srcMac = payload + 10;  
+  const uint8_t *tags = payload + 24;    
+  int tagsLen = len - 24;
+  int pos = 0;
+  char ssid[SSID_MAX_LEN + 1];
+  if (!extractSSID(tags, tagsLen, &pos, ssid, sizeof(ssid))) return;
 
-  char ssid[33];
-  if (!extractSSID(tagged, tagged_len, ssid, sizeof(ssid))) return;
+  int rssi = ppkt->rx_ctrl.rssi;
+  int avgRSSI = rssi;
+  Device *d = getDeviceOrAdd(srcMac, rssi);
+  if (d) avgRSSI = d->avgRSSI;
 
-  Device *d = getDeviceOrAdd(srcMac, ssid, rssi);
-  if (!d) return;
-
-  int avg = d->avgRSSI;
-  int distanceCM = estimateDistanceCM(avg);
-
-  // Build CSV line: timestamp_ms,channel,rssi,avg_rssi,distance_cm,MAC,SSID
   char macStr[18];
   macToHexStr(srcMac, macStr, sizeof(macStr));
-  char line[PENDING_LINE_MAX];
-  int written = snprintf(line, sizeof(line), "%lu,%u,%d,%d,%d,%s,%s",
-    millis(), (unsigned)ch, (int)rssi, (int)avg, distanceCM, macStr, ssid);
-  if (written > 0) {
-    enqueueLineFromCallback(line);
-    packetDetected = true; // blink LED
-  }
+  unsigned long timestamp = millis();
+  int distanceCM = estimateDistanceCM(avgRSSI);
+
+  // One CSV line per SSID: timestamp_ms,channel,rssi,avg_rssi,distance_cm,mac,ssid
+  do {
+    char line[PENDING_LINE_MAX];
+    int written = snprintf(line, sizeof(line), "%lu,%u,%d,%d,%d,%s,%s",
+                           timestamp, (unsigned)ppkt->rx_ctrl.channel, rssi,
+                           avgRSSI, distanceCM, macStr, ssid);
+    if (written > 0) {
+      enqueueLine(line);
+      packetDetected = true;
+    }
+  } while (extractSSID(tags, tagsLen, &pos, ssid, sizeof(ssid)));
 }
 
-// Flush buffer to SPIFFS (called from loop)
+// Sends csv to SPIFFS incase of loss of power
 void flushPendingToSPIFFS() {
-  if (pending_count <= 0) return;
-  File f = SPIFFS.open("/probes.csv", "a");
-  if (!f) { //if it doesn't work don't worry
+  if (!fsReady || pendingCount == 0) return;
+  File f = SPIFFS.open(CSV_PATH, FILE_APPEND);
+  if (!f) return;
+  char line[PENDING_LINE_MAX];
+  while (dequeueLine(line)) f.println(line);
+  f.close();
+}
+
+// Serves CSV to user
+void sendCSV() {
+  if (!fsReady) {
+    Serial.println("SPIFFS not mounted");
     return;
   }
-  while (pending_count > 0) {
-    f.println(pending[pending_head]);
-    pending_head = (pending_head + 1) % PENDING_CAP;
-    --pending_count;
+  flushPendingToSPIFFS();
+  File f = SPIFFS.open(CSV_PATH, FILE_READ);
+  if (!f) {
+    Serial.println("No CSV file found");
+    return;
+  }
+  uint8_t buf[256];
+  while (f.available()) {
+    int n = f.read(buf, sizeof(buf));
+    Serial.write(buf, n);
   }
   f.close();
+  Serial.println("---END---");
 }
 
 void setup() {
@@ -192,18 +213,12 @@ void setup() {
   delay(20);
   esp_log_level_set("wifi", ESP_LOG_NONE);
 
-  // set up LED
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, LOW);
-  packetDetected = false;
-  ledEndTime = 0;
 
-  // SPIFFS
-  if (!SPIFFS.begin(true)) {
-    Serial.println("SPIFFS mount failed");
-  }
+  fsReady = SPIFFS.begin(true);
+  if (!fsReady) Serial.println("SPIFFS mount failed; logging disabled");
 
-  // initialize wifi for promiscuous sniffing
   WiFi.mode(WIFI_MODE_NULL);
   esp_wifi_stop();
   wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
@@ -212,37 +227,29 @@ void setup() {
   esp_wifi_set_mode(WIFI_MODE_NULL);
   esp_wifi_start();
 
-  // set into promiscuous mode
-  esp_wifi_set_promiscuous(true);
-  esp_wifi_set_promiscuous_rx_cb(&snifferCallback);
-
   wifi_promiscuous_filter_t filt;
   filt.filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT;
   esp_wifi_set_promiscuous_filter(&filt);
+  esp_wifi_set_promiscuous_rx_cb(&snifferCallback);
+  esp_wifi_set_promiscuous(true);
 
-  currentChannel = CHANNEL_MIN;
   esp_wifi_set_channel(currentChannel, WIFI_SECOND_CHAN_NONE);
   lastHop = millis();
 
-  // ensure CSV exists / header if you want (optional)
-  if (SPIFFS.exists("/probes.csv") == false) {
-    File f = SPIFFS.open("/probes.csv", "w");
+  if (fsReady && !SPIFFS.exists(CSV_PATH)) {
+    File f = SPIFFS.open(CSV_PATH, FILE_WRITE);
     if (f) {
       f.println("timestamp_ms,channel,rssi,avg_rssi,distance_cm,mac,ssid");
       f.close();
     }
   }
 
-  Serial.println("Sniffer started (max 5 devices). Type GET_CSV and press Enter to download.");
+  Serial.printf("Sniffer started (max %d devices). Type GET_CSV and press Enter to download.\n", MAX_DEVICES);
 }
-
-unsigned long lastFlushMs = 0;
-const unsigned long FLUSH_INTERVAL_MS = 2000; // flush every 2s
 
 void loop() {
   unsigned long now = millis();
 
-  // channel hopping
   if (now - lastHop >= CHANNEL_HOP_MS) {
     lastHop = now;
     currentChannel++;
@@ -250,41 +257,26 @@ void loop() {
     esp_wifi_set_channel(currentChannel, WIFI_SECOND_CHAN_NONE);
   }
 
-  // Periodically add lines to SPIFFS
-  if ((now - lastFlushMs) >= FLUSH_INTERVAL_MS) {
-    lastFlushMs = now;
+  if (now - lastFlush >= FLUSH_INTERVAL_MS) {
+    lastFlush = now;
     flushPendingToSPIFFS();
   }
 
-  // Handle USB Serial command GET_CSV
   if (Serial.available()) {
     String cmd = Serial.readStringUntil('\n');
     cmd.trim();
-    if (cmd.equalsIgnoreCase("GET_CSV")) {
-      // flush before sending
-      flushPendingToSPIFFS();
-      File f = SPIFFS.open("/probes.csv", "r");
-      if (f) {
-        while (f.available()) {
-          Serial.write(f.read());
-        }
-        f.close();
-        Serial.println("\n---END---");
-      } else {
-        Serial.println("No CSV file found");
-      }
-    }
+    if (cmd.equalsIgnoreCase("GET_CSV")) sendCSV();
   }
 
-  // LED blink when packet detected
   if (packetDetected) {
-    digitalWrite(LED_PIN, HIGH);
-    ledEndTime = now + LED_BLINK_MS;
     packetDetected = false;
+    digitalWrite(LED_PIN, HIGH);
+    ledOn = true;
+    ledOnSince = now;
   }
-  if (ledEndTime && now > ledEndTime) {
+  if (ledOn && now - ledOnSince >= LED_BLINK_MS) {
     digitalWrite(LED_PIN, LOW);
-    ledEndTime = 0;
+    ledOn = false;
   }
 
   delay(1);
